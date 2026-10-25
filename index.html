@@ -275,6 +275,7 @@ label:has(.file-in:focus-visible) { outline: 3px solid var(--stress); outline-of
 .wl.model { background: var(--cyan-ink); }
 .wl.me { background: var(--bg); }
 .rec-actions { display: flex; gap: .6em; align-items: center; flex-wrap: wrap; }
+.btn.rec-on { background: var(--rec); color: #fff; box-shadow: 0 .22em 0 #9E2A2E; animation: pulse 1s ease-in-out infinite; }
 .prompt { display: flex; flex-direction: column; gap: .7em; }
 .prompt-body { flex: 1; display: flex; flex-direction: column; justify-content: center; gap: .7em; }
 .card-instr { font-weight: 600; font-size: 1.05em; }
@@ -1310,9 +1311,14 @@ function renderFinish(el) {
 }
 
 // ===== record yourself =====
-// claude.ai doesn't let pages use the microphone, so students record with their phone's voice recorder and add the file.
+// Students record with the microphone in the page. Where that isn't allowed (an embed without microphone access, an old browser,
+// or the student blocked it) they add a file from their phone's voice recorder instead.
 // Their recording is drawn under the model's waveform so they can compare the two.
 const TAKES = {}, MODELS = {};
+const MAX_REC = 60; // seconds
+let MIC_OFF = false;
+const micReady = () => !MIC_OFF && !!(navigator.mediaDevices?.getUserMedia && window.MediaRecorder) && window.isSecureContext !== false
+  && (document.featurePolicy?.allowsFeature?.('microphone') ?? true);
 const REC_SETS = {
   pairs: PAIRS.map((p) => ({ id: 'p-' + p.v.w, kind: 'pair', p, label: `${p.v.w} · ${p.n.w}`, src: [`media/w/${p.v.w}.mp3`, `media/w/${p.n.w}.mp3`] })),
   ate: ATE.map((a) => ({ id: 'a-' + a.w, kind: 'ate', a, label: a.w, src: [`media/s/${a.w}-v.mp3`, `media/s/${a.w}-n.mp3`] })),
@@ -1361,18 +1367,84 @@ function recorderUI(item) {
   const meCv = h('canvas', { 'aria-label': 'Waveform of your recording' });
   const pm = playBtn('Play the model', 'play sm'), pme = playBtn('Play my recording', 'play sm');
   const both = h('button', { class: 'btn sm', type: 'button' }, icon('replay'), 'Model, then me');
-  // Record now opens the phone's voice recorder (capture); the second picker takes a recording saved earlier
-  const [recNow, savedIn] = [true, false].map((capture) => h('input', { id: `rec-${capture ? 'now' : 'saved'}-${item.id}`, class: 'file-in', type: 'file', accept: 'audio/*', capture }));
-  const addLbl = h('span', {}, 'Record now');
+  // Record now records right here with the microphone (Android, iPhone and computers).
+  // Where the page can't use the microphone it falls back to adding a file; the second picker takes a recording saved earlier
+  const useMic = micReady();
+  const [recNow, savedIn] = ['now', 'saved'].map((k) => h('input', { id: `rec-${k}-${item.id}`, class: 'file-in', type: 'file', accept: 'audio/*' }));
+  const addLbl = h('span', {}, 'Record now'), micLbl = h('span', {}, 'Record now');
   const add = h('label', { class: 'btn' }, icon('mic'), addLbl, recNow);
+  const micBtn = h('button', { class: 'btn', type: 'button' }, icon('mic'), micLbl);
   const saved = h('label', { class: 'linkish' }, 'or choose a saved recording', savedIn);
   const status = h('p', { class: 'rec-status', 'aria-live': 'polite' });
+  const help = h('p', { class: 'rec-help', hidden: useMic }, 'iPhone: record in Voice Memos, tap Share → Save to Files, then choose a saved recording.');
   const ui = { item, modelCv, meCv, pme, both, status };
   const take = () => TAKES[item.id];
+  let rec = null, recTimer = 0;
   ui.redraw = () => { drawWave(modelCv, MODELS[item.id] || null, MODEL_COLOR); drawWave(meCv, take()?.W || null, ME_COLOR); };
-  ui.sync = () => { pme.disabled = !take(); both.disabled = !take(); addLbl.textContent = take() ? 'Record again' : 'Record now'; };
-  status.textContent = take() ? 'Tap “Model, then me” to compare. Record again if you want a better take.' : 'Tap Record now and say it. When you finish, your recording comes back here.';
+  ui.sync = () => { pme.disabled = !take(); both.disabled = !take(); addLbl.textContent = take() ? 'Record again' : 'Record now'; if (!rec) micLbl.textContent = addLbl.textContent; };
+  status.textContent = take() ? 'Tap “Model, then me” to compare. Record again if you want a better take.' : useMic ? 'Tap Record now and say it. Tap Stop when you finish.' : 'Tap Record now and say it. When you finish, your recording comes back here.';
   ui.sync();
+
+  // recording in the page: the mic is released as soon as the take stops, or if the student leaves the slide mid-take
+  const toFiles = (msg) => { MIC_OFF = true; if (micBtn.isConnected) { micBtn.replaceWith(add); help.hidden = false; status.textContent = msg; sfx('bad'); } };
+  const stopRec = (keep) => {
+    if (!rec) return;
+    const r = rec; rec = null; clearInterval(recTimer);
+    r.keep = keep;
+    micBtn.classList.remove('rec-on');
+    ui.sync();
+    if (keep) status.textContent = 'Reading your recording…';
+    if (r.state !== 'inactive') r.stop();
+  };
+  async function startRec() {
+    stopAudio();
+    micBtn.disabled = true;
+    status.textContent = 'Allow the microphone if your browser asks.';
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+      micBtn.disabled = false;
+      toFiles(e?.name === 'NotFoundError' || e?.name === 'OverconstrainedError'
+        ? 'No microphone was found. Choose a saved recording instead.'
+        : 'The microphone is blocked. Allow it in your browser settings and reload, or tap Record now to add a recording from your phone.');
+      return;
+    }
+    micBtn.disabled = false;
+    const release = () => stream.getTracks().forEach((t) => t.stop());
+    if (!micBtn.isConnected) { release(); return; }
+    const chunks = [];
+    let r;
+    try {
+      r = new MediaRecorder(stream);
+      r.ondataavailable = (e) => { if (e.data?.size) chunks.push(e.data); };
+      r.onstop = () => {
+        release();
+        if (actx && actx.state !== 'running') actx.resume().catch(() => {});
+        if (!r.keep) return;
+        if (!chunks.length) { if (cur?.rec === ui) { status.textContent = 'Nothing was recorded. Tap Record now and try again.'; sfx('bad'); } return; }
+        addTake(ui, new Blob(chunks, { type: r.mimeType || chunks[0].type || 'audio/webm' }));
+      };
+      r.start();
+    } catch {
+      release();
+      toFiles('This browser can’t record here. Tap Record now to add a recording from your phone.');
+      return;
+    }
+    rec = r;
+    const t0 = Date.now();
+    micBtn.classList.add('rec-on');
+    micLbl.textContent = 'Stop';
+    const show = () => {
+      if (!micBtn.isConnected) return stopRec(false);
+      const s = (Date.now() - t0) / 1000;
+      if (s >= MAX_REC) return stopRec(true);
+      status.textContent = `Recording… ${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}  Tap Stop when you finish.`;
+    };
+    show();
+    recTimer = setInterval(show, 250);
+  }
+  micBtn.addEventListener('click', () => (rec ? stopRec(true) : startRec()));
 
   // model and my take
   const modelSteps = (btn) => item.src.map((src, k) => ({
@@ -1400,12 +1472,12 @@ function recorderUI(item) {
   const el = h('div', { class: 'recorder' },
     h('p', { class: 'rec-title' }, 'Record yourself'),
     status,
-    h('div', { class: 'rec-actions' }, add, saved),
+    h('div', { class: 'rec-actions' }, useMic ? micBtn : add, saved),
     h('div', { class: 'waves' },
       h('div', { class: 'wrow' }, h('span', { class: 'wl model' }, 'Model'), modelCv, pm),
       h('div', { class: 'wrow' }, h('span', { class: 'wl me' }, 'You'), meCv, pme)),
     h('div', { class: 'rec-actions' }, both),
-    h('p', { class: 'rec-help' }, 'iPhone: record in Voice Memos, tap Share → Save to Files, then choose a saved recording.'));
+    help);
   return { el, ui };
 }
 async function addTake(ui, file) {
